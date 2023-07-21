@@ -56,7 +56,7 @@ export class GitHubDiff implements Diff {
         ref: undefined,
       });
       return (response.data.files || [])
-        .filter((file) => file.status != "removed")
+        .filter((file) => (!(file.status = "removed" || (file.status == 'modified' && file.changes == file.deletions))))
         .map((file) => file.filename);
     }
   }
