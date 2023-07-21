@@ -46,7 +46,7 @@ export class GitHubDiff implements Diff {
       const commit = await this.github.repos.getCommit(params);
       return (
         commit.data.files
-          ?.filter((file) => file.status != "removed")
+          ?.filter((file) => (!(file.status == "removed" || (file.status == 'modified' && file.changes == file.deletions))))
           .map((file) => file.filename)
           .filter(isDefined) || []
       );
