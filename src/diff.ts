@@ -45,7 +45,10 @@ export class GitHubDiff implements Diff {
     // base and head will both be the same
     if (params.base === params.head) {
       const commit = await this.github.repos.getCommit(params);
-      debug(`Possible files changed before filtering: ${commit.data.files}`);
+      if (commit?.data?.files) {
+        debug(`Possible files changed before filtering: `);
+        commit.data.files.forEach( (file) => debug(JSON.stringify(file)))
+      }
       return (
         commit.data.files
           ?.filter((file) => (!(file.status == "removed" || (file.status == 'modified' && file.changes == file.deletions))))
@@ -57,7 +60,10 @@ export class GitHubDiff implements Diff {
         ...params,
         ref: undefined,
       });
-      debug(`Possible files changed before filtering: ${response.data.files}`);
+      if (response?.data?.files) {
+        debug(`Possible files changed before filtering: `);
+        response.data.files.forEach( (file) => debug(JSON.stringify(file)))
+      }
       return (response.data.files || [])
         .filter((file) => (!(file.status = "removed" || (file.status == 'modified' && file.changes == file.deletions))))
         .map((file) => file.filename);
