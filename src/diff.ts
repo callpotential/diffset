@@ -1,5 +1,6 @@
 import { Minimatch } from "minimatch";
 import { Octokit } from "@octokit/rest";
+import { debug, warning } from "@actions/core";
 
 export type Params = {
   base: string;
@@ -44,6 +45,7 @@ export class GitHubDiff implements Diff {
     // base and head will both be the same
     if (params.base === params.head) {
       const commit = await this.github.repos.getCommit(params);
+      debug(`Possible files changed before filtering: ${commit.data.files}`);
       return (
         commit.data.files
           ?.filter((file) => (!(file.status == "removed" || (file.status == 'modified' && file.changes == file.deletions))))
@@ -55,6 +57,7 @@ export class GitHubDiff implements Diff {
         ...params,
         ref: undefined,
       });
+      debug(`Possible files changed before filtering: ${response.data.files}`);
       return (response.data.files || [])
         .filter((file) => (!(file.status = "removed" || (file.status == 'modified' && file.changes == file.deletions))))
         .map((file) => file.filename);
