@@ -1,0 +1,293 @@
+# AI Code Review - GitHub Actions Workflow
+#
+# This workflow runs AI-powered code reviews on pull requests using Claude via AWS Bedrock.
+# It's the GitHub equivalent of the GitLab CI review.yml configuration.
+#
+# Required secrets:
+#   - AWS credentials configured via OIDC (recommended) or secrets
+#   - GITHUB_TOKEN (automatically provided)
+#
+# Optional secrets:
+#   - JIRA_API_USER: JIRA username for context fetching
+#   - JIRA_API_TOKEN: JIRA API token
+#
+# Usage in other repositories:
+#   Include this as a reusable workflow or copy to your repo's .github/workflows/
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Prevent concurrent reviews on the same PR
+concurrency:
+  group: ai-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # Required for AWS OIDC authentication
+
+env:
+  # Review configuration - can be overridden via repository variables
+  CLAUDE_REVIEW_ENABLED: ${{ vars.CLAUDE_REVIEW_ENABLED || 'true' }}
+  CLAUDE_MAX_TURNS: ${{ vars.CLAUDE_MAX_TURNS || 50 }}
+  JIRA_CONTEXT_ENABLED: ${{ vars.JIRA_CONTEXT_ENABLED || 'true' }}
+  JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY || '' }}
+  BEDROCK_MODEL_ID: ${{ vars.BEDROCK_MODEL_ID || 'arn:aws:bedrock:us-east-2:188572534221:application-inference-profile/6lwk0jdnbhu0' }}
+  AWS_REGION: 'us-east-2'
+  AI_REVIEW_CONTAINER_IMAGE: '499468066138.dkr.ecr.us-east-2.amazonaws.com/storable-devops-ai-review-pipeline'
+  AI_REVIEW_CONTAINER_TAG: ${{ vars.AI_REVIEW_CONTAINER_TAG || 'v1' }}
+
+jobs:
+  jira-context:
+    name: Fetch JIRA Context
+    runs-on: ubuntu-latest
+    if: ${{ vars.JIRA_CONTEXT_ENABLED == 'true' && vars.JIRA_PROJECT_KEY != '' }}
+    outputs:
+      jira_context_available: ${{ steps.jira.outputs.available }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN || 'arn:aws:iam::188572534221:role/gh-storable-bedrock' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "499468066138"
+
+      - name: Fetch JIRA Context
+        id: jira
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL || 'https://sparefoot.atlassian.net' }}
+          JIRA_API_USER: ${{ secrets.JIRA_API_USER }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ env.JIRA_PROJECT_KEY }}
+          PLATFORM: github
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          docker run --rm \
+            --entrypoint /usr/local/bin/ai-review \
+            -e GITHUB_TOKEN \
+            -e JIRA_BASE_URL \
+            -e JIRA_API_USER \
+            -e JIRA_API_TOKEN \
+            -e JIRA_PROJECT_KEY \
+            -e PLATFORM \
+            -e PR_NUMBER \
+            -e REPOSITORY \
+            -e PR_TITLE \
+            -e PR_BODY \
+            -e PR_SOURCE_BRANCH \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "${{ env.AI_REVIEW_CONTAINER_IMAGE }}:${{ env.AI_REVIEW_CONTAINER_TAG }}" \
+            jira-context || true
+
+          if [ -f jira-context.md ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload JIRA context artifacts
+        if: steps.jira.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jira-context
+          path: |
+            jira-context.md
+            jira-context.json
+          retention-days: 7
+
+  ai-review:
+    name: Claude Code Review
+    runs-on: ubuntu-latest
+    needs: [jira-context]
+    if: |
+      always() &&
+      (needs.jira-context.result == 'success' || needs.jira-context.result == 'skipped') &&
+      vars.CLAUDE_REVIEW_ENABLED != 'false'
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history needed for accurate diffs
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN || 'arn:aws:iam::188572534221:role/gh-storable-bedrock' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "499468066138"
+
+      - name: Download JIRA context
+        if: needs.jira-context.outputs.jira_context_available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: jira-context
+          path: .
+
+      - name: Run Claude Code Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLATFORM: github
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          BEDROCK_MODEL_ID: ${{ env.BEDROCK_MODEL_ID }}
+          BEDROCK_ROLE_ARN: ${{ vars.BEDROCK_ROLE_ARN || '' }}
+          CLAUDE_CODE_USE_BEDROCK: "1"
+          CLAUDE_MAX_TURNS: ${{ env.CLAUDE_MAX_TURNS }}
+          AI_REVIEW_DEBUG: ${{ vars.AI_REVIEW_DEBUG || '0' }}
+        run: |
+          echo "🚀 Running Claude Code review..."
+          echo "Platform: GitHub"
+          echo "Model: ${BEDROCK_MODEL_ID}"
+          echo "Region: ${AWS_REGION}"
+          echo "PR: #${PR_NUMBER}"
+          echo "Base SHA: ${BASE_SHA}"
+          echo "Head SHA: ${HEAD_SHA}"
+
+          docker run --rm \
+            --entrypoint /usr/local/bin/ai-review \
+            -e GITHUB_TOKEN \
+            -e PLATFORM \
+            -e PR_NUMBER \
+            -e REPOSITORY \
+            -e BASE_SHA \
+            -e HEAD_SHA \
+            -e GITHUB_BASE_REF \
+            -e GITHUB_HEAD_REF \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            -e AWS_REGION \
+            -e BEDROCK_MODEL_ID \
+            -e BEDROCK_ROLE_ARN \
+            -e CLAUDE_CODE_USE_BEDROCK \
+            -e AI_REVIEW_DEBUG \
+            -e CLAUDE_MAX_TURNS \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "${{ env.AI_REVIEW_CONTAINER_IMAGE }}:${{ env.AI_REVIEW_CONTAINER_TAG }}" \
+            claude-review
+
+      - name: Upload review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-artifacts
+          path: |
+            bedrock-prompt.md
+            bedrock-output.json.raw
+            bedrock-output.json
+          retention-days: 7
+
+  assign-reviewers:
+    name: Assign Reviewers
+    runs-on: ubuntu-latest
+    needs: [jira-context]
+    if: |
+      always() &&
+      (needs.jira-context.result == 'success' || needs.jira-context.result == 'skipped') &&
+      vars.AI_REVIEW_AUTO_ASSIGN != 'false'
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1000
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base branch for author history
+        run: |
+          # Fetch the base branch to get its commit history for author detection
+          # This is needed because checkout only fetches the PR branch history
+          git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1000
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN || 'arn:aws:iam::188572534221:role/gh-storable-bedrock' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "499468066138"
+
+      - name: Download JIRA context
+        if: needs.jira-context.outputs.jira_context_available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: jira-context
+          path: .
+
+      - name: Assign Reviewers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLATFORM: github
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AI_REVIEW_AUTO_ASSIGN: ${{ vars.AI_REVIEW_AUTO_ASSIGN || '1' }}
+          AI_REVIEW_ASSIGN_MODEL: ${{ vars.AI_REVIEW_ASSIGN_MODEL || 'arn:aws:bedrock:us-east-2:188572534221:application-inference-profile/e66hknbsa6l6' }}
+          AI_REVIEW_REVIEWER_COUNT: ${{ vars.AI_REVIEW_REVIEWER_COUNT || '2' }}
+          AI_REVIEW_BALANCE_WINDOW_DAYS: ${{ vars.AI_REVIEW_BALANCE_WINDOW_DAYS || '7' }}
+          BEDROCK_ROLE_ARN: ${{ vars.BEDROCK_ROLE_ARN || '' }}
+          CLAUDE_CODE_USE_BEDROCK: "1"
+        run: |
+          echo "🔍 Assigning reviewers based on git history..."
+          echo "Model: ${AI_REVIEW_ASSIGN_MODEL}"
+          echo "Reviewer count: ${AI_REVIEW_REVIEWER_COUNT}"
+
+          docker run --rm \
+            --entrypoint /usr/local/bin/ai-review \
+            -e GITHUB_TOKEN \
+            -e PLATFORM \
+            -e PR_NUMBER \
+            -e REPOSITORY \
+            -e BASE_SHA \
+            -e HEAD_SHA \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            -e AWS_REGION \
+            -e AI_REVIEW_AUTO_ASSIGN \
+            -e AI_REVIEW_ASSIGN_MODEL \
+            -e AI_REVIEW_REVIEWER_COUNT \
+            -e AI_REVIEW_BALANCE_WINDOW_DAYS \
+            -e BEDROCK_ROLE_ARN \
+            -e CLAUDE_CODE_USE_BEDROCK \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "${{ env.AI_REVIEW_CONTAINER_IMAGE }}:${{ env.AI_REVIEW_CONTAINER_TAG }}" \
+            assign-reviewers || true
