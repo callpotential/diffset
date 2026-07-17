@@ -1,6 +1,5 @@
 import { Minimatch } from "minimatch";
 import { Octokit } from "@octokit/rest";
-import { debug, warning } from "@actions/core";
 
 export type Params = {
   base: string;
@@ -41,19 +40,17 @@ export class GitHubDiff implements Diff {
     this.github = github;
   }
   async diff(params: Params): Promise<Array<string>> {
-    debug(`Diffing ${params.base}...${params.head}`)
     // if this is a merge to master push
     // base and head will both be the same
     if (params.base === params.head) {
       const commit = await this.github.repos.getCommit(params);
-      if (commit?.data?.files) {
-        debug(`Possible files changed before filtering: `);
-        commit.data.files.forEach( (file) => debug(JSON.stringify(file)))
-      }
       return (
         commit.data.files
-          ?.filter((file) => (file.status != "removed"))
-          .filter((file) => (!(file.status == "modified" && file.changes == file.deletions)))
+          ?.filter((file) => file.status != "removed")
+          .filter(
+            (file) =>
+              !(file.status == "modified" && file.changes == file.deletions)
+          )
           .map((file) => file.filename)
           .filter(isDefined) || []
       );
@@ -62,20 +59,13 @@ export class GitHubDiff implements Diff {
         ...params,
         ref: undefined,
       });
-      if (response?.data?.files) {
-        debug(`Possible files changed before filtering: `);
-        response.data.files.forEach( (file) => debug(JSON.stringify(file)))
-        response.data.files.forEach( (file) => debug(JSON.stringify(file) + "/n"));  
-      }
-
-      let changed_files = (response.data.files || [])
-        .filter((file) => (file.status != "removed"))
-        .filter((file) => (!(file.status == "modified" && file.changes == file.deletions)));
-
-      debug(`Files changed after filtering:`);
-      changed_files.forEach( (file) => debug(JSON.stringify(file) + "/n"));  
-
-      return changed_files.map((file) => file.filename);
+      return (response.data.files || [])
+        .filter((file) => file.status != "removed")
+        .filter(
+          (file) =>
+            !(file.status == "modified" && file.changes == file.deletions)
+        )
+        .map((file) => file.filename);
     }
   }
 }
